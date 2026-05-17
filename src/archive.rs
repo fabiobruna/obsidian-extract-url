@@ -111,28 +111,55 @@ async fn archive_document(
     let file_manager = app.file_manager();
     if let Some(active) = workspace.get_active_file() {
         let content_js: JsString = JsFuture::from(vault.read(&active)).await?.dyn_into()?;
-        let mut content = String::from(content_js);
+        let content = String::from(content_js);
+
+        let urls: Vec<String> = document_to_urls(&content)?.collect();
+        if urls.is_empty() {
+            obsidian::Notice::new("no urls found to archive");
+            return Ok(());
+        }
+
+        obsidian::Notice::new(&format!("archiving {} urls...", urls.len()));
+
+        let mut futures = Vec::new();
+        for url in &urls {
+            futures.push(async move {
+                let md = url_to_markdown(url).await?;
+                let file = persist_markdown(settings, &vault, url, &md).await?;
+                Ok::<(String, MarkdownFile), ArchiveError>((url.clone(), file))
+            });
+        }
+
+        let results = futures::future::join_all(futures).await;
         let mut markdown_map: HashMap<String, MarkdownFile> = HashMap::new();
-        for url in document_to_urls(&content)? {
-            let msg = format!("archiving: {}", &url);
-            obsidian::Notice::new(&msg);
-            let md = url_to_markdown(&url).await?;
-            let file = persist_markdown(settings, &vault, &url, &md).await?;
+
+        for res in results {
+            let (url, file) = res?;
             markdown_map.insert(url, file);
         }
-        content = URL_REGEX
+
+        let updated_content = URL_REGEX
             .replace_all(&content, |caps: &Captures| {
                 let url = caps.name("url").unwrap();
-                let md = markdown_map.get(url.as_str()).unwrap();
-                let text = match caps.name("text") {
-                    Some(x) => Some(x.as_str()),
-                    None => Some(md.title.as_str()),
-                };
-                file_manager.generate_markdown_link(&md.file, &settings.archive_path(), None, text)
+                if let Some(md) = markdown_map.get(url.as_str()) {
+                    let text = match caps.name("text") {
+                        Some(x) => Some(x.as_str()),
+                        None => Some(md.title.as_str()),
+                    };
+                    file_manager.generate_markdown_link(
+                        &md.file,
+                        &settings.archive_path(),
+                        None,
+                        text,
+                    )
+                } else {
+                    caps.get(0).unwrap().as_str().to_string()
+                }
             })
-            .into();
-        JsFuture::from(vault.modify(&active, &content)).await?;
-        obsidian::Notice::new(&"archive complete");
+            .into_owned();
+
+        JsFuture::from(vault.modify(&active, &updated_content)).await?;
+        obsidian::Notice::new("archive complete");
         Ok(())
     } else {
         Err(ArchiveError::NoActiveFile)
